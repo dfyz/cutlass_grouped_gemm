@@ -1,46 +1,54 @@
 import os
 from pathlib import Path
 from setuptools import setup, find_packages
-import torch
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-if not torch.cuda.is_available():
-    if os.environ.get("TORCH_CUDA_ARCH_LIST", None) is None:
-        os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
-cwd = Path(os.path.dirname(os.path.abspath(__file__)))
-_dc = torch.cuda.get_device_capability()
-_dc = f"{_dc[0]}{_dc[1]}"
-
-ext_modules = [
-    CUDAExtension(
-        "grouped_gemm_backend",
-        ["csrc/ops.cu", "csrc/grouped_gemm.cu"],
-        include_dirs = [
-            f"{cwd}/third_party/cutlass/include/",
-            f"{cwd}/csrc"
-        ],
-        extra_compile_args={
-            "cxx": [
-                "-fopenmp", "-fPIC", "-Wno-strict-aliasing"
-            ],
-            "nvcc": [
-                f"--generate-code=arch=compute_{_dc},code=sm_{_dc}",
-                f"-DGROUPED_GEMM_DEVICE_CAPABILITY={_dc}",
-                # NOTE: CUTLASS requires c++17.
-                "-std=c++17",
-            ],
-        }
-    )
-]
-
+# Initialize ext_modules to an empty list
+ext_modules = []
 extra_deps = {}
+cmdclass = {}
+
+# Attempt to import torch and define CUDA extensions only if torch is available
+try:
+    import torch
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    cwd = Path(os.path.dirname(os.path.abspath(__file__)))
+    _dc = torch.cuda.get_device_capability()
+    _dc = f"{_dc[0]}{_dc[1]}"
+
+    ext_modules = [
+        CUDAExtension(
+            "grouped_gemm_backend",
+            ["csrc/ops.cu", "csrc/grouped_gemm.cu"],
+            include_dirs=[
+                f"{cwd}/third_party/cutlass/include/",
+                f"{cwd}/csrc"
+            ],
+            extra_compile_args={
+                "cxx": [
+                    "-fopenmp", "-fPIC", "-Wno-strict-aliasing"
+                ],
+                "nvcc": [
+                    f"--generate-code=arch=compute_{_dc},code=sm_{_dc}",
+                    f"-DGROUPED_GEMM_DEVICE_CAPABILITY={_dc}",
+                    # NOTE: CUTLASS requires c++17.
+                    "-std=c++17",
+                ],
+            }
+        )
+    ]
+    # Define the build_ext command only if torch is available
+    cmdclass = {"build_ext": BuildExtension}
+except ImportError as e:
+    print("PyTorch is not available, CUDA extensions will not be built.")
+
 
 extra_deps['dev'] = [
     'absl-py',
 ]
-
 extra_deps['all'] = set(dep for deps in extra_deps.values() for dep in deps)
+
 
 setup(
     name="cutlass_grouped_gemm",
@@ -58,6 +66,6 @@ setup(
     ],
     packages=find_packages(),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
+    cmdclass=cmdclass,
     extras_require=extra_deps,
 )
