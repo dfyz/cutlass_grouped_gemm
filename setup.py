@@ -52,7 +52,6 @@ extra_deps['all'] = set(dep for deps in extra_deps.values() for dep in deps)
 
 setup(
     name="cutlass_grouped_gemm",
-    version="0.0.2",
     author="One",
     author_email="imonenext@gmail.com",
     description="CUTLASS Grouped GEMM",
@@ -64,6 +63,8 @@ setup(
         "License :: OSI Approved :: Apache Software License",
         "Operating System :: Unix",
     ],
+    use_scm_version=True,
+    setup_requires=['setuptools_scm'],
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
