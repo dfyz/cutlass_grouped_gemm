@@ -1,8 +1,10 @@
 #include "grouped_gemm.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/detail/KernelUtils.h>
 #include <c10/util/BFloat16.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cub/cub.cuh>
 #include <torch/extension.h>
 
 #include "cutlass/bfloat16.h"
@@ -32,33 +34,72 @@
 #error "Unsupported compute capability " GROUPED_GEMM_STRINGIFY(GROUPED_GEMM_DEVICE_CAPABILITY)
 #endif
 
+constexpr int kDynamicDim = -1;
 
 template <typename T>
-torch::Tensor copy_to_device(const std::vector<T> &x, const torch::Device &device) {
-    size_t bytes = x.size() * sizeof(T);
-    auto options = torch::TensorOptions().dtype(torch::kInt8).device(device);
-    torch::Tensor out = torch::empty(bytes, options);
-
-    cudaError_t status = cudaMemcpyAsync(out.data_ptr(),
-                                         x.data(), bytes,
-                                         cudaMemcpyHostToDevice,
-                                         c10::cuda::getCurrentCUDAStream());
-    TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
-    return out;
+torch::Tensor typed_empty(size_t numel, const torch::Device& device) {
+    return torch::empty(numel * sizeof(T), torch::dtype(torch::kInt8).device(device));
 }
 
+struct ExtractK {
+    __device__ ::cuda::std::tuple<int&> operator()(cutlass::gemm::GemmCoord& coord) const {
+        return {coord.k()};
+    }
+};
 
-template <typename T>
-static void reorder_array(T* data, const std::vector<size_t>& indices) {
-    // For now, simply create a copy of the data and then copy over to the original.
-    std::vector<T> copy(indices.size());
-    for (size_t i = 0; i < indices.size(); ++i) {
-        copy.at(i) = data[indices[i]];
+__device__ __forceinline__ int PrepareCoord(int raw_coord, int batch_size) {
+    return raw_coord == kDynamicDim ? batch_size : raw_coord;
+}
+
+template <
+    bool sort_problems,
+    typename ElementA, typename ElementB, typename ElementC,
+    typename LayoutA, typename LayoutB, typename LayoutC,
+    typename Args
+>
+__global__ void FillArguments(
+    int num_experts, const int64_t* batch_sizes,
+    ElementA* ptr_a, ElementB* ptr_b, ElementC* ptr_c,
+    Args& args, cutlass::gemm::GemmCoord raw_coord
+) {
+    const int expert_idx = threadIdx.x;
+    const int batch_size = expert_idx < num_experts ? batch_sizes[expert_idx] : -1;
+
+    cutlass::gemm::GemmCoord coord[1] = {
+        cutlass::gemm::GemmCoord(
+            PrepareCoord(raw_coord.m(), batch_size),
+            PrepareCoord(raw_coord.n(), batch_size),
+            PrepareCoord(raw_coord.k(), batch_size)
+        )
+    };
+
+    using BlockSort = cub::BlockRadixSort<cutlass::gemm::GemmCoord, at::cuda::detail::CUDA_NUM_THREADS, 1>;
+    using BlockScan = cub::BlockScan<cutlass::gemm::GemmCoord, at::cuda::detail::CUDA_NUM_THREADS>;
+
+    union SharedMemory {
+        BlockSort::TempStorage sort_storage;
+        BlockScan::TempStorage scan_storage;
+    };
+    __shared__ SharedMemory shared_memory;
+
+    if constexpr (sort_problems) {
+        BlockSort(shared_memory.sort_storage).SortDescending(coord, ExtractK{});
+        __syncthreads();
     }
 
-    memcpy(data, copy.data(), indices.size() * sizeof(T));
-}
+    cutlass::gemm::GemmCoord coord_before;
+    BlockScan(shared_memory.scan_storage).ExclusiveSum(coord[0], coord_before);
 
+    if (expert_idx < num_experts) {
+        args.problem_sizes[expert_idx] = coord[0];
+        args.lda[expert_idx] = LayoutA::packed({coord[0].m(), coord[0].k()}).stride(0);;
+        args.ldb[expert_idx] = LayoutB::packed({coord[0].k(), coord[0].n()}).stride(0);;
+        args.ldc[expert_idx] = LayoutC::packed({coord[0].m(), coord[0].n()}).stride(0);
+        args.ptr_A[expert_idx] = ptr_a + coord_before.m() * coord_before.k();
+        args.ptr_B[expert_idx] = ptr_b + coord_before.k() * coord_before.n();
+        args.ptr_C[expert_idx] = ptr_c + coord_before.m() * coord_before.n();
+    }
+}
 
 template <
     typename layoutA,
@@ -116,99 +157,68 @@ public:
                        torch::Tensor a,
 				       torch::Tensor b,
 				       torch::Tensor c,
-				       std::vector<cutlass::gemm::GemmCoord> &problem_sizes_host) {
-        // Calculate the number of threadblocks to use and validate the result.
-        int64_t num_experts = problem_sizes_host.size();
+				       torch::Tensor batch_sizes,
+                       const cutlass::gemm::GemmCoord& coord) {
+        int64_t num_experts = batch_sizes.size(0);
 
-        // Create the host arrays of leading dimension data and pointer data.
-        using LayoutA = typename GemmGrouped::LayoutA;
-        using LayoutB = typename GemmGrouped::LayoutB;
-        using LayoutC = typename GemmGrouped::LayoutC;
-
-        std::vector<int64_t> lda_host(num_experts), offsets_a(num_experts);
-        std::vector<int64_t> ldb_host(num_experts), offsets_b(num_experts);
-        std::vector<int64_t> ldc_host(num_experts), offsets_c(num_experts);
-        int64_t elements_a = 0, elements_b = 0, elements_c = 0;
-
-        using ElementA = typename GemmGrouped::ElementA;
-        using ElementB = typename GemmGrouped::ElementB;
-        using ElementC = typename GemmGrouped::ElementC;
-        std::vector<ElementA *> ptr_a_host(num_experts);
-        std::vector<ElementB *> ptr_b_host(num_experts);
-        std::vector<ElementC *> ptr_c_host(num_experts);
-
-        for (int i = 0; i < num_experts; ++i) {
-            auto problem = problem_sizes_host[i];
-            lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
-            ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
-            ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
-
-            offsets_a[i] = elements_a;
-            offsets_b[i] = elements_b;
-            offsets_c[i] = elements_c;
-
-            ptr_a_host[i] = (ElementA*)a.data_ptr() + offsets_a[i];
-            ptr_b_host[i] = (ElementB*)b.data_ptr() + offsets_b[i];
-            ptr_c_host[i] = (ElementC*)c.data_ptr() + offsets_c[i];
-
-            elements_a += problem.m() * problem.k();
-            elements_b += problem.k() * problem.n();
-            elements_c += problem.m() * problem.n();
-        }
-
-        // Sort problems
-        if (sort_problems) {
-            std::vector<size_t> indices(num_experts);
-            std::iota(indices.begin(), indices.end(), 0);
-            std::stable_sort(indices.begin(), indices.end(), [&problem_sizes_host](size_t i, size_t j) {
-                return problem_sizes_host[i].k() > problem_sizes_host[j].k();
-            });
-
-            reorder_array(problem_sizes_host.data(), indices);
-            reorder_array(lda_host.data(), indices);
-            reorder_array(ldb_host.data(), indices);
-            reorder_array(ldc_host.data(), indices);
-            reorder_array(ptr_a_host.data(), indices);
-            reorder_array(ptr_b_host.data(), indices);
-            reorder_array(ptr_c_host.data(), indices);
-        }
-
-        // Copy the problem sizes, pointers and leading dimension data to the device.
-        torch::Tensor lda = copy_to_device(lda_host, a.device());
-        torch::Tensor ldb = copy_to_device(ldb_host, a.device());
-        torch::Tensor ldc = copy_to_device(ldc_host, a.device());
-        torch::Tensor ptr_a = copy_to_device(ptr_a_host, a.device());
-        torch::Tensor ptr_b = copy_to_device(ptr_b_host, a.device());
-        torch::Tensor ptr_c = copy_to_device(ptr_c_host, a.device());
-        torch::Tensor problem_sizes = copy_to_device(problem_sizes_host, a.device());
+        TORCH_CHECK(num_experts <= at::cuda::detail::CUDA_NUM_THREADS);
 
         // Threadblock count
-        const int threadblock_count = GemmGrouped::sufficient(problem_sizes_host.data(), num_experts);
+        // We don't know the real number number of tiles, so we just base the count on occupancy here.
+        const int threadblock_count = GemmGrouped::sufficient();
         if (!threadblock_count) {
             TORCH_CHECK(false, "Grouped GEMM execution not possible with HW");
         }
 
+        using LayoutA = typename GemmGrouped::LayoutA;
+        using LayoutB = typename GemmGrouped::LayoutB;
+        using LayoutC = typename GemmGrouped::LayoutC;
+
+        using ElementA = typename GemmGrouped::ElementA;
+        using ElementB = typename GemmGrouped::ElementB;
+        using ElementC = typename GemmGrouped::ElementC;
+
+        torch::Tensor lda = typed_empty<int64_t>(num_experts, a.device());
+        torch::Tensor ldb = typed_empty<int64_t>(num_experts, a.device());
+        torch::Tensor ldc = typed_empty<int64_t>(num_experts, a.device());
+        torch::Tensor ptr_a = typed_empty<ElementA*>(num_experts, a.device());
+        torch::Tensor ptr_b = typed_empty<ElementB*>(num_experts, a.device());
+        torch::Tensor ptr_c = typed_empty<ElementC*>(num_experts, a.device());
+        torch::Tensor problem_sizes = typed_empty<cutlass::gemm::GemmCoord>(num_experts, a.device());
+
+        // We don't specify `host_problem_sizes` because we don't know them.
+        // This is fine, since the default `GroupScheduleMode_` is `kDeviceOnly`.
         typename GemmGrouped::EpilogueOutputOp::Params epilogue_op(/*alpha=*/1.0f, /*beta=*/0.0f);
         typename GemmGrouped::Arguments arguments((cutlass::gemm::GemmCoord*)problem_sizes.data_ptr(),
                             (int)num_experts,
                             (int)threadblock_count,
                             epilogue_op,
-                            (ElementA **)ptr_a.data_ptr(),
-                            (ElementB **)ptr_b.data_ptr(),
-                            (ElementC **)ptr_c.data_ptr(),
-                            (ElementC **)ptr_c.data_ptr(),
-                            /*lda=*/(int64_t*)lda.data_ptr(),
-                            /*ldb=*/(int64_t*)ldb.data_ptr(),
-                            /*ldc=*/(int64_t*)ldc.data_ptr(),
-                            /*ldd=*/(int64_t*)ldc.data_ptr(),
-                            (cutlass::gemm::GemmCoord*)problem_sizes_host.data());
+                            (ElementA**)ptr_a.data_ptr(),
+                            (ElementB**)ptr_b.data_ptr(),
+                            (ElementC**)ptr_c.data_ptr(),
+                            (ElementC**)ptr_c.data_ptr(),
+                            /*lda=*/lda.data_ptr<int64_t>(),
+                            /*ldb=*/ldb.data_ptr<int64_t>(),
+                            /*ldc=*/ldc.data_ptr<int64_t>(),
+                            /*ldd=*/ldc.data_ptr<int64_t>());
+
+        // Use a single block so that we don't need any additional global memory.
+        FillArguments<
+            sort_problems,
+            ElementA, ElementB, ElementC,
+            LayoutA, LayoutB, LayoutC
+        ><<<1, at::cuda::detail::CUDA_NUM_THREADS>>>(
+            num_experts, batch_sizes.data_ptr<int64_t>(),
+            (ElementA*)a.data_ptr(), (ElementB*)b.data_ptr(), (ElementC*)c.data_ptr(),
+            arguments, coord
+        );
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
 
         // Run Grouped GEMM
         GemmGrouped gemm;
 
         int64_t workspace_size = gemm.get_workspace_size(arguments);
-        auto options = torch::TensorOptions().dtype(torch::kInt8).device(a.device());
-        torch::Tensor workspace = torch::empty(workspace_size, options);
+        torch::Tensor workspace = typed_empty<uint8_t>(workspace_size, a.device());
 
         // Initialize the kernel.
         if(gemm.initialize(arguments, workspace.data_ptr()) != cutlass::Status::kSuccess) {
@@ -258,7 +268,7 @@ namespace grouped_gemm {
         TORCH_CHECK(a.is_cuda());
         TORCH_CHECK(b.is_cuda());
         TORCH_CHECK(c.is_cuda());
-        TORCH_CHECK(batch_sizes.is_cpu());
+        TORCH_CHECK(batch_sizes.is_cuda());
 
         TORCH_CHECK(a.scalar_type() == torch::kBFloat16);
         TORCH_CHECK(b.scalar_type() == torch::kBFloat16);
@@ -300,33 +310,18 @@ namespace grouped_gemm {
             TORCH_CHECK(c.size(1) == hidden_out);
         }
 
-        // Construct problem sizes and run
-        std::vector<::cutlass::gemm::GemmCoord> problem_sizes_host(num_experts);
-
         if (trans_a) {
-            // Trans A
-            for (int i = 0; i < num_experts; ++i) {
-                problem_sizes_host[i] = cutlass::gemm::GemmCoord(hidden_in, hidden_out, batch_sizes.data_ptr<int64_t>()[i]);
-            }
-
             // Only sort problems when trans_a = True because only this case K are different
-            ::cutlass_grouped_gemm<::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, true>::run(a, b, c, problem_sizes_host);
+            const auto coord = cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim);
+            ::cutlass_grouped_gemm<::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, true>::run(a, b, c, batch_sizes, coord);
         }
         else if (trans_b) {
-            // Trans B
-            for (int i = 0; i < num_experts; ++i) {
-                problem_sizes_host[i] = cutlass::gemm::GemmCoord(batch_sizes.data_ptr<int64_t>()[i], hidden_out, hidden_in);
-            }
-
-            ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::ColumnMajor, ::cutlass::bfloat16_t, float, false>::run(a, b, c, problem_sizes_host);
+            const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
+            ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::ColumnMajor, ::cutlass::bfloat16_t, float, false>::run(a, b, c, batch_sizes, coord);
         }
         else {
-            // No transpose A & B
-            for (int i = 0; i < num_experts; ++i) {
-                problem_sizes_host[i] = cutlass::gemm::GemmCoord(batch_sizes.data_ptr<int64_t>()[i], hidden_out, hidden_in);
-            }
-
-            ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, false>::run(a, b, c, problem_sizes_host);
+            const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
+            ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, false>::run(a, b, c, batch_sizes, coord);
         }
     }
 };
