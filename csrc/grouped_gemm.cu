@@ -103,8 +103,8 @@ __global__ void FillArguments(
         const int a_offset = dynamic_k
             ? (coord[0].m() * dynamic_dim_cumsum)
             : (dynamic_dim_cumsum * coord[0].k());
-        const int b_offset = (dynamic_k ? dynamic_dim_cumsum : coord[0].k()) * coord[0].n();
-        const int c_offset = (dynamic_k ? coord[0].m() : dynamic_dim_cumsum) * coord[0].n();
+        const int b_offset = (dynamic_k ? dynamic_dim_cumsum : expert_idx * coord[0].k()) * coord[0].n();
+        const int c_offset = (dynamic_k ? expert_idx * coord[0].m() : dynamic_dim_cumsum) * coord[0].n();
 
         args.ptr_A[expert_idx] = ptr_a + a_offset;
         args.ptr_B[expert_idx] = ptr_b + b_offset;
