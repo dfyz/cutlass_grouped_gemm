@@ -41,7 +41,7 @@ def randn(bs, x, y):
 
 
 def gmm(a, b, batch_sizes, trans_b=False):
-    batch_sizes = batch_sizes.numpy()
+    batch_sizes = batch_sizes.cpu().numpy()
 
     out = []
     start = 0
@@ -59,7 +59,7 @@ class OpsTest(parameterized.TestCase):
         torch.manual_seed(0)
         a = randn(z, m, k).view(-1, k)
         b = randn(z, n, k) if trans_b else randn(z, k, n)
-        batch_sizes = torch.tensor([m] * z)
+        batch_sizes = torch.tensor([m] * z).cuda()
 
         a.requires_grad_(True)
         b.requires_grad_(True)
@@ -87,6 +87,7 @@ class OpsTest(parameterized.TestCase):
         error = m * z - batch_sizes.sum()
         batch_sizes[-1] += error
         assert batch_sizes.sum() == (m * z)
+        batch_sizes = batch_sizes.cuda()
 
         a.requires_grad_(True)
         b.requires_grad_(True)
