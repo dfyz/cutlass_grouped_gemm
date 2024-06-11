@@ -90,6 +90,7 @@ __global__ void FillArguments(
     int dynamic_dim = dynamic_k ? dims.k() : dims.m();
     int dynamic_dim_cumsum;
     BlockScan(shared_memory.scan_storage).ExclusiveSum(dynamic_dim, dynamic_dim_cumsum);
+    __syncthreads();
 
     GemmProblem problem[1] = {
         GemmProblem {
@@ -107,7 +108,10 @@ __global__ void FillArguments(
 
     if constexpr (sort_problems) {
         BlockSort(shared_memory.sort_storage).SortDescending(problem, ExtractGemmProblemK{});
-        __syncthreads();
+        // Quoting the CUB documentation (https://nvidia.github.io/cccl/cub/api/classcub_1_1BlockRadixSort.html):
+        // > A subsequent __syncthreads() threadblock barrier should be invoked after calling this method if the collective’s temporary storage [...]
+        // > is **to be reused or repurposed**.
+        // We don't need `__syncthreads()` here, since we don't do either of these things.
     }
 
     if (expert_idx < num_experts) {
