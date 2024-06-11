@@ -41,15 +41,18 @@ torch::Tensor typed_empty(size_t numel, const torch::Device& device) {
     return torch::empty(numel * sizeof(T), torch::dtype(torch::kInt8).device(device));
 }
 
-struct ExtractK {
-    __device__ ::cuda::std::tuple<int&> operator()(cutlass::gemm::GemmCoord& coord) const {
-        return {coord.k()};
-    }
+struct GemmProblem {
+    cutlass::gemm::GemmCoord dims;
+    int lda, ldb, ldc;
+    // All offsets are in elements.
+    int a_offset, b_offset, c_offset;
 };
 
-__device__ __forceinline__ int PrepareCoord(int raw_coord, int batch_size) {
-    return raw_coord == kDynamicDim ? batch_size : raw_coord;
-}
+struct ExtractGemmProblemK {
+    __device__ ::cuda::std::tuple<int&> operator()(GemmProblem& problem) const {
+        return {problem.dims.k()};
+    }
+};
 
 template <
     bool sort_problems,
@@ -60,55 +63,62 @@ template <
 __global__ void FillArguments(
     int num_experts, const int64_t* batch_sizes,
     ElementA* ptr_a, ElementB* ptr_b, ElementC* ptr_c,
-    Args args, cutlass::gemm::GemmCoord raw_coord,
+    Args args, cutlass::gemm::GemmCoord dims,
     // Exactly one of `m` or `k` is dynamic.
     bool dynamic_k
 ) {
     const int expert_idx = threadIdx.x;
     const int batch_size = expert_idx < num_experts ? batch_sizes[expert_idx] : -1;
 
-    cutlass::gemm::GemmCoord coord[1] = {raw_coord};
     if (dynamic_k) {
-        assert(coord[0].k() == kDynamicDim);
-        coord[0].k() = batch_size;
+        assert(dims.k() == kDynamicDim);
+        dims.k() = batch_size;
     } else {
-        assert(coord[0].m() == kDynamicDim);
-        coord[0].m() = batch_size;
+        assert(dims.m() == kDynamicDim);
+        dims.m() = batch_size;
     }
 
-    using BlockSort = cub::BlockRadixSort<cutlass::gemm::GemmCoord, at::cuda::detail::CUDA_NUM_THREADS, 1>;
     using BlockScan = cub::BlockScan<int, at::cuda::detail::CUDA_NUM_THREADS>;
+    using BlockSort = cub::BlockRadixSort<GemmProblem, at::cuda::detail::CUDA_NUM_THREADS, 1>;
 
     union SharedMemory {
-        BlockSort::TempStorage sort_storage;
         BlockScan::TempStorage scan_storage;
+        BlockSort::TempStorage sort_storage;
     };
     __shared__ SharedMemory shared_memory;
 
-    if constexpr (sort_problems) {
-        BlockSort(shared_memory.sort_storage).SortDescending(coord, ExtractK{});
-        __syncthreads();
-    }
-
-    int dynamic_dim = dynamic_k ? coord[0].k() : coord[0].m();
+    int dynamic_dim = dynamic_k ? dims.k() : dims.m();
     int dynamic_dim_cumsum;
     BlockScan(shared_memory.scan_storage).ExclusiveSum(dynamic_dim, dynamic_dim_cumsum);
 
+    GemmProblem problem[1] = {
+        GemmProblem {
+            .dims = dims,
+            .lda = LayoutA::packed({dims.m(), dims.k()}).stride(0),
+            .ldb = LayoutB::packed({dims.k(), dims.n()}).stride(0),
+            .ldc = LayoutC::packed({dims.m(), dims.n()}).stride(0),
+            .a_offset = dynamic_k
+                ? (dims.m() * dynamic_dim_cumsum)
+                : (dynamic_dim_cumsum * dims.k()),
+            .b_offset = (dynamic_k ? dynamic_dim_cumsum : expert_idx * dims.k()) * dims.n(),
+            .c_offset = (dynamic_k ? expert_idx * dims.m() : dynamic_dim_cumsum) * dims.n(),
+        },
+    };
+
+    if constexpr (sort_problems) {
+        BlockSort(shared_memory.sort_storage).SortDescending(problem, ExtractGemmProblemK{});
+        __syncthreads();
+    }
+
     if (expert_idx < num_experts) {
-        args.problem_sizes[expert_idx] = coord[0];
-        args.lda[expert_idx] = LayoutA::packed({coord[0].m(), coord[0].k()}).stride(0);
-        args.ldb[expert_idx] = LayoutB::packed({coord[0].k(), coord[0].n()}).stride(0);
-        args.ldc[expert_idx] = LayoutC::packed({coord[0].m(), coord[0].n()}).stride(0);
+        args.problem_sizes[expert_idx] = problem[0].dims;
+        args.lda[expert_idx] = problem[0].lda;
+        args.ldb[expert_idx] = problem[0].ldb;
+        args.ldc[expert_idx] = problem[0].ldc;
 
-        const int a_offset = dynamic_k
-            ? (coord[0].m() * dynamic_dim_cumsum)
-            : (dynamic_dim_cumsum * coord[0].k());
-        const int b_offset = (dynamic_k ? dynamic_dim_cumsum : expert_idx * coord[0].k()) * coord[0].n();
-        const int c_offset = (dynamic_k ? expert_idx * coord[0].m() : dynamic_dim_cumsum) * coord[0].n();
-
-        args.ptr_A[expert_idx] = ptr_a + a_offset;
-        args.ptr_B[expert_idx] = ptr_b + b_offset;
-        args.ptr_C[expert_idx] = ptr_c + c_offset;
+        args.ptr_A[expert_idx] = ptr_a + problem[0].a_offset;
+        args.ptr_B[expert_idx] = ptr_b + problem[0].b_offset;
+        args.ptr_C[expert_idx] = ptr_c + problem[0].c_offset;
     }
 }
 
