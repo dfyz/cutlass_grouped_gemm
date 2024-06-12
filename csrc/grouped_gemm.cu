@@ -65,64 +65,43 @@ template <
 __global__ void FillArguments(
     int num_experts, const int64_t* batch_sizes,
     ElementA* ptr_a, ElementB* ptr_b, ElementC* ptr_c,
-    Args args, cutlass::gemm::GemmCoord dims
+    Args args, cutlass::gemm::GemmCoord dims,
+    size_t hidden_in, size_t hidden_out
 ) {
-    const int expert_idx = threadIdx.x;
-    const int batch_size = expert_idx < num_experts ? batch_sizes[expert_idx] : -1;
-
+    constexpr size_t MAX_N_EXPERTS = 8;
+    cutlass::gemm::GemmCoord problem_sizes[MAX_N_EXPERTS];
     if (dynamic_k) {
-        assert(dims.k() == kDynamicDim);
-        dims.k() = batch_size;
+        for (int i = 0; i < num_experts; ++i) {
+            args.problem_sizes[i] = cutlass::gemm::GemmCoord(hidden_in, hidden_out, batch_sizes[i]);
+        }
     } else {
-        assert(dims.m() == kDynamicDim);
-        dims.m() = batch_size;
+        for (int i = 0; i < num_experts; ++i) {
+            args.problem_sizes[i] = cutlass::gemm::GemmCoord(batch_sizes[i], hidden_out, hidden_in);
+        }
     }
 
-    using BlockScan = cub::BlockScan<int, at::cuda::detail::CUDA_NUM_THREADS>;
-    using BlockSort = cub::BlockRadixSort<GemmProblem, at::cuda::detail::CUDA_NUM_THREADS, 1>;
+    int64_t offsets_a[MAX_N_EXPERTS];
+    int64_t offsets_b[MAX_N_EXPERTS];
+    int64_t offsets_c[MAX_N_EXPERTS];
+    int64_t elements_a = 0, elements_b = 0, elements_c = 0;
 
-    union SharedMemory {
-        BlockScan::TempStorage scan_storage;
-        BlockSort::TempStorage sort_storage;
-    };
-    __shared__ SharedMemory shared_memory;
+    for (int i = 0; i < num_experts; ++i) {
+        auto problem = args.problem_sizes[i];
+        args.lda[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
+        args.ldb[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
+        args.ldc[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
 
-    int dynamic_dim = dynamic_k ? dims.k() : dims.m();
-    int dynamic_dim_cumsum;
-    BlockScan(shared_memory.scan_storage).ExclusiveSum(dynamic_dim, dynamic_dim_cumsum);
-    __syncthreads();
+        offsets_a[i] = elements_a;
+        offsets_b[i] = elements_b;
+        offsets_c[i] = elements_c;
 
-    GemmProblem problem[1] = {
-        GemmProblem {
-            .dims = dims,
-            .lda = LayoutA::packed({dims.m(), dims.k()}).stride(0),
-            .ldb = LayoutB::packed({dims.k(), dims.n()}).stride(0),
-            .ldc = LayoutC::packed({dims.m(), dims.n()}).stride(0),
-            .a_offset = dynamic_k
-                ? (dims.m() * dynamic_dim_cumsum)
-                : (dynamic_dim_cumsum * dims.k()),
-            .b_offset = (dynamic_k ? dynamic_dim_cumsum : expert_idx * dims.k()) * dims.n(),
-            .c_offset = (dynamic_k ? expert_idx * dims.m() : dynamic_dim_cumsum) * dims.n(),
-        },
-    };
+        args.ptr_A[i] = ptr_a + offsets_a[i];
+        args.ptr_B[i] = ptr_b + offsets_b[i];
+        args.ptr_C[i] = ptr_c + offsets_c[i];
 
-    if constexpr (dynamic_k) {
-        BlockSort(shared_memory.sort_storage).SortDescending(problem, ExtractGemmProblemK{});
-        // Quoting the CUB documentation (https://nvidia.github.io/cccl/cub/api/classcub_1_1BlockRadixSort.html):
-        // > A subsequent __syncthreads() threadblock barrier should be invoked after calling this method if the collective’s temporary storage [...]
-        // > is **to be reused or repurposed**.
-        // We don't need `__syncthreads()` here, since we don't do either of these things.
-    }
-
-    if (expert_idx < num_experts) {
-        args.problem_sizes[expert_idx] = problem[0].dims;
-        args.lda[expert_idx] = problem[0].lda;
-        args.ldb[expert_idx] = problem[0].ldb;
-        args.ldc[expert_idx] = problem[0].ldc;
-
-        args.ptr_A[expert_idx] = ptr_a + problem[0].a_offset;
-        args.ptr_B[expert_idx] = ptr_b + problem[0].b_offset;
-        args.ptr_C[expert_idx] = ptr_c + problem[0].c_offset;
+        elements_a += problem.m() * problem.k();
+        elements_b += problem.k() * problem.n();
+        elements_c += problem.m() * problem.n();
     }
 }
 
@@ -183,7 +162,8 @@ public:
 				       torch::Tensor b,
 				       torch::Tensor c,
 				       torch::Tensor batch_sizes,
-                       const cutlass::gemm::GemmCoord& coord) {
+                       const cutlass::gemm::GemmCoord& coord,
+                       size_t hidden_in, size_t hidden_out) {
         int64_t num_experts = batch_sizes.size(0);
 
         TORCH_CHECK(num_experts <= at::cuda::detail::CUDA_NUM_THREADS);
@@ -232,10 +212,11 @@ public:
             dynamic_k,
             ElementA, ElementB, ElementC,
             LayoutA, LayoutB, LayoutC
-        ><<<1, at::cuda::detail::CUDA_NUM_THREADS, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        ><<<1, 1, 0, c10::cuda::getCurrentCUDAStream()>>>(
             num_experts, batch_sizes.data_ptr<int64_t>(),
             (ElementA*)a.data_ptr(), (ElementB*)b.data_ptr(), (ElementC*)c.data_ptr(),
-            arguments, coord
+            arguments, coord,
+            hidden_in, hidden_out
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -339,19 +320,19 @@ namespace grouped_gemm {
             // Only sort problems when trans_a = True because only this case K are different
             const auto coord = cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim);
             ::cutlass_grouped_gemm<::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, true>::run(
-                a, b, c, batch_sizes, coord
+                a, b, c, batch_sizes, coord, hidden_in, hidden_out
             );
         }
         else if (trans_b) {
             const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
             ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::ColumnMajor, ::cutlass::bfloat16_t, float, false>::run(
-                a, b, c, batch_sizes, coord
+                a, b, c, batch_sizes, coord, hidden_in, hidden_out
             );
         }
         else {
             const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
             ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, false>::run(
-                a, b, c, batch_sizes, coord
+                a, b, c, batch_sizes, coord, hidden_in, hidden_out
             );
         }
     }
