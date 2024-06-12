@@ -55,7 +55,9 @@ struct ExtractGemmProblemK {
 };
 
 template <
-    bool sort_problems,
+    // If `k` is dynamic, we sort the problems by `k` in descending order.
+    // Otherwise, `m` is dynamic, and no sorting happens.
+    bool dynamic_k,
     typename ElementA, typename ElementB, typename ElementC,
     typename LayoutA, typename LayoutB, typename LayoutC,
     typename Args
@@ -63,9 +65,7 @@ template <
 __global__ void FillArguments(
     int num_experts, const int64_t* batch_sizes,
     ElementA* ptr_a, ElementB* ptr_b, ElementC* ptr_c,
-    Args args, cutlass::gemm::GemmCoord dims,
-    // Exactly one of `m` or `k` is dynamic.
-    bool dynamic_k
+    Args args, cutlass::gemm::GemmCoord dims
 ) {
     const int expert_idx = threadIdx.x;
     const int batch_size = expert_idx < num_experts ? batch_sizes[expert_idx] : -1;
@@ -106,7 +106,7 @@ __global__ void FillArguments(
         },
     };
 
-    if constexpr (sort_problems) {
+    if constexpr (dynamic_k) {
         BlockSort(shared_memory.sort_storage).SortDescending(problem, ExtractGemmProblemK{});
         // Quoting the CUB documentation (https://nvidia.github.io/cccl/cub/api/classcub_1_1BlockRadixSort.html):
         // > A subsequent __syncthreads() threadblock barrier should be invoked after calling this method if the collective’s temporary storage [...]
@@ -131,7 +131,7 @@ template <
     typename layoutB,
     typename operandDtype,
     typename accumulatorDtype,
-    bool sort_problems,
+    bool dynamic_k,
 
     // default config
     typename OperatorClass_ = ::cutlass::arch::OpClassTensorOp,
@@ -183,8 +183,7 @@ public:
 				       torch::Tensor b,
 				       torch::Tensor c,
 				       torch::Tensor batch_sizes,
-                       const cutlass::gemm::GemmCoord& coord,
-                       bool dynamic_k) {
+                       const cutlass::gemm::GemmCoord& coord) {
         int64_t num_experts = batch_sizes.size(0);
 
         TORCH_CHECK(num_experts <= at::cuda::detail::CUDA_NUM_THREADS);
@@ -230,13 +229,13 @@ public:
 
         // Use a single block so that we don't need any additional global memory.
         FillArguments<
-            sort_problems,
+            dynamic_k,
             ElementA, ElementB, ElementC,
             LayoutA, LayoutB, LayoutC
         ><<<1, at::cuda::detail::CUDA_NUM_THREADS, 0, c10::cuda::getCurrentCUDAStream()>>>(
             num_experts, batch_sizes.data_ptr<int64_t>(),
             (ElementA*)a.data_ptr(), (ElementB*)b.data_ptr(), (ElementC*)c.data_ptr(),
-            arguments, coord, dynamic_k
+            arguments, coord
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -340,19 +339,19 @@ namespace grouped_gemm {
             // Only sort problems when trans_a = True because only this case K are different
             const auto coord = cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim);
             ::cutlass_grouped_gemm<::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, true>::run(
-                a, b, c, batch_sizes, coord, true
+                a, b, c, batch_sizes, coord
             );
         }
         else if (trans_b) {
             const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
             ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::ColumnMajor, ::cutlass::bfloat16_t, float, false>::run(
-                a, b, c, batch_sizes, coord, false
+                a, b, c, batch_sizes, coord
             );
         }
         else {
             const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
             ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, false>::run(
-                a, b, c, batch_sizes, coord, false
+                a, b, c, batch_sizes, coord
             );
         }
     }
