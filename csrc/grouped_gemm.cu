@@ -54,6 +54,52 @@ struct ExtractGemmProblemK {
     }
 };
 
+template <typename T>
+std::vector<T> copy_from_device(const torch::Tensor& t) {
+    std::vector<T> res(t.numel() / sizeof(T));
+
+    cudaError_t status = cudaMemcpyAsync((uint8_t*)res.data(),
+                                         t.data_ptr(), t.numel(),
+                                         cudaMemcpyDeviceToHost,
+                                         c10::cuda::getCurrentCUDAStream());
+    TORCH_CHECK(status == cudaSuccess, cudaGetErrorString(status));
+    TORCH_CHECK(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream()) == cudaSuccess);
+    return res;
+}
+
+template <typename T>
+static void reorder_array(T* data, const std::vector<size_t>& indices) {
+    // For now, simply create a copy of the data and then copy over to the original.
+    std::vector<T> copy(indices.size());
+    for (size_t i = 0; i < indices.size(); ++i) {
+        copy.at(i) = data[indices[i]];
+    }
+
+    memcpy(data, copy.data(), indices.size() * sizeof(T));
+}
+
+template <typename T>
+void compare_vectors(const std::vector<T>& a, const std::vector<T>& b, const char* tensor_names) {
+    TORCH_CHECK(a.size() == b.size(), tensor_names, " have different sizes: ", a.size(), " vs ", b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        TORCH_CHECK(a[i] == b[i], tensor_names, " have different values at index ", i, ": ", a[i], " vs ", b[i]);
+    }
+}
+
+template <>
+void compare_vectors<cutlass::gemm::GemmCoord>(
+    const std::vector<cutlass::gemm::GemmCoord>& a,
+    const std::vector<cutlass::gemm::GemmCoord>& b,
+    const char* tensor_names
+) {
+    TORCH_CHECK(a.size() == b.size(), tensor_names, " have different sizes: ", a.size(), " vs ", b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        TORCH_CHECK(a[i].n() == b[i].n(), tensor_names, " have different n's at index ", i, ": ", a[i].n(), " vs ", b[i].n());
+        TORCH_CHECK(a[i].m() == b[i].m(), tensor_names, " have different m's at index ", i, ": ", a[i].m(), " vs ", b[i].m());
+        TORCH_CHECK(a[i].k() == b[i].k(), tensor_names, " have different k's at index ", i, ": ", a[i].k(), " vs ", b[i].k());
+    }
+}
+
 template <
     // If `k` is dynamic, we sort the problems by `k` in descending order.
     // Otherwise, `m` is dynamic, and no sorting happens.
@@ -183,7 +229,8 @@ public:
 				       torch::Tensor b,
 				       torch::Tensor c,
 				       torch::Tensor batch_sizes,
-                       const cutlass::gemm::GemmCoord& coord) {
+                       const cutlass::gemm::GemmCoord& coord,
+                       size_t hidden_in, size_t hidden_out) {
         int64_t num_experts = batch_sizes.size(0);
 
         TORCH_CHECK(num_experts <= at::cuda::detail::CUDA_NUM_THREADS);
@@ -238,6 +285,77 @@ public:
             arguments, coord
         );
         C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+        auto batch_sizes_host = copy_from_device<int64_t>(batch_sizes.view(torch::kInt8));
+        std::vector<::cutlass::gemm::GemmCoord> problem_sizes_host(num_experts);
+        if (dynamic_k) {
+            for (int i = 0; i < num_experts; ++i) {
+                problem_sizes_host[i] = cutlass::gemm::GemmCoord(hidden_in, hidden_out, batch_sizes_host[i]);
+            }
+        } else {
+            for (int i = 0; i < num_experts; ++i) {
+                problem_sizes_host[i] = cutlass::gemm::GemmCoord(batch_sizes_host[i], hidden_out, hidden_in);
+            }
+        }
+
+        std::vector<int64_t> lda_host(num_experts), offsets_a(num_experts);
+        std::vector<int64_t> ldb_host(num_experts), offsets_b(num_experts);
+        std::vector<int64_t> ldc_host(num_experts), offsets_c(num_experts);
+        int64_t elements_a = 0, elements_b = 0, elements_c = 0;
+        std::vector<ElementA *> ptr_a_host(num_experts);
+        std::vector<ElementB *> ptr_b_host(num_experts);
+        std::vector<ElementC *> ptr_c_host(num_experts);
+
+        for (int i = 0; i < num_experts; ++i) {
+            auto problem = problem_sizes_host[i];
+            lda_host[i] = LayoutA::packed({problem.m(), problem.k()}).stride(0);
+            ldb_host[i] = LayoutB::packed({problem.k(), problem.n()}).stride(0);
+            ldc_host[i] = LayoutC::packed({problem.m(), problem.n()}).stride(0);
+
+            offsets_a[i] = elements_a;
+            offsets_b[i] = elements_b;
+            offsets_c[i] = elements_c;
+
+            ptr_a_host[i] = (ElementA*)a.data_ptr() + offsets_a[i];
+            ptr_b_host[i] = (ElementB*)b.data_ptr() + offsets_b[i];
+            ptr_c_host[i] = (ElementC*)c.data_ptr() + offsets_c[i];
+
+            elements_a += problem.m() * problem.k();
+            elements_b += problem.k() * problem.n();
+            elements_c += problem.m() * problem.n();
+        }
+
+        if (dynamic_k) {
+            std::vector<size_t> indices(num_experts);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::stable_sort(indices.begin(), indices.end(), [&problem_sizes_host](size_t i, size_t j) {
+                return problem_sizes_host[i].k() > problem_sizes_host[j].k();
+            });
+
+            reorder_array(problem_sizes_host.data(), indices);
+            reorder_array(lda_host.data(), indices);
+            reorder_array(ldb_host.data(), indices);
+            reorder_array(ldc_host.data(), indices);
+            reorder_array(ptr_a_host.data(), indices);
+            reorder_array(ptr_b_host.data(), indices);
+            reorder_array(ptr_c_host.data(), indices);
+        }
+
+        auto problem_sizes_device = copy_from_device<::cutlass::gemm::GemmCoord>(problem_sizes);
+        auto lda_device = copy_from_device<int64_t>(lda);
+        auto ldb_device = copy_from_device<int64_t>(ldb);
+        auto ldc_device = copy_from_device<int64_t>(ldc);
+        auto ptr_a_device = copy_from_device<ElementA*>(ptr_a);
+        auto ptr_b_device = copy_from_device<ElementB*>(ptr_b);
+        auto ptr_c_device = copy_from_device<ElementC*>(ptr_c);
+
+        compare_vectors(problem_sizes_host, problem_sizes_device, "problem_sizes");
+        compare_vectors(lda_host, lda_device, "lda");
+        compare_vectors(ldb_host, ldb_device, "ldb");
+        compare_vectors(ldc_host, ldc_device, "ldc");
+        compare_vectors(ptr_a_host, ptr_a_device, "ptr_a");
+        compare_vectors(ptr_b_host, ptr_b_device, "ptr_b");
+        compare_vectors(ptr_c_host, ptr_c_device, "ptr_c");
 
         // Run Grouped GEMM
         GemmGrouped gemm;
@@ -339,19 +457,19 @@ namespace grouped_gemm {
             // Only sort problems when trans_a = True because only this case K are different
             const auto coord = cutlass::gemm::GemmCoord(hidden_in, hidden_out, kDynamicDim);
             ::cutlass_grouped_gemm<::cutlass::layout::ColumnMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, true>::run(
-                a, b, c, batch_sizes, coord
+                a, b, c, batch_sizes, coord, hidden_in, hidden_out
             );
         }
         else if (trans_b) {
             const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
             ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::ColumnMajor, ::cutlass::bfloat16_t, float, false>::run(
-                a, b, c, batch_sizes, coord
+                a, b, c, batch_sizes, coord, hidden_in, hidden_out
             );
         }
         else {
             const auto coord = cutlass::gemm::GemmCoord(kDynamicDim, hidden_out, hidden_in);
             ::cutlass_grouped_gemm<::cutlass::layout::RowMajor, ::cutlass::layout::RowMajor, ::cutlass::bfloat16_t, float, false>::run(
-                a, b, c, batch_sizes, coord
+                a, b, c, batch_sizes, coord, hidden_in, hidden_out
             );
         }
     }
