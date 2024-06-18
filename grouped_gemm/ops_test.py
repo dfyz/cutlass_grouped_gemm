@@ -133,5 +133,26 @@ class EdgeCasesTest(unittest.TestCase):
         self.assertTrue(allclose(b.grad, b_ref.grad))
 
 
+class ProfileTest(unittest.TestCase):
+    def testBench(self):
+        torch.manual_seed(0)
+        m = 16384
+        k = 4096
+        n = 14336
+        num_experts = 8
+
+        a = randn(num_experts, m // num_experts, k).view(-1, k)
+        # b = randn(num_experts, k, n)
+        b = randn(num_experts, n, k)
+        # batch_sizes = torch.tensor([219, 2246, 5, 8103, 1, 1117, 4693, 0]).to(torch.long).cuda()
+        batch_sizes = torch.tensor([0, 0, 0, 8192, 0, 0, 0, 8192]).to(torch.long).cuda()
+
+        a.requires_grad_(True)
+        b.requires_grad_(True)
+
+        out = ops.gmm(a, b, batch_sizes, trans_b=True)
+        out.sum().backward()
+
+
 if __name__ == '__main__':
     unittest.main()
