@@ -152,6 +152,34 @@ __global__ void FillArguments(
     }
 }
 
+uint64_t* BlockTimings;
+uint64_t ThreadblockCount;
+
+void bumpKernelCounter(void*) {
+    ++BlockTimings[0];
+
+    if (BlockTimings[0] == 3 * 30 && strcmp(getenv("RANK"), "0") == 0) {
+        FILE* f = fopen("cutlass_timings.json", "w");
+        fprintf(f, "{\"traceEvents\":[\n");
+
+        for (size_t kIdx = 0; kIdx < 3 * 30; ++kIdx) {
+            for (size_t chIdx = 0; chIdx < ThreadblockCount; ++chIdx) {
+                uint64_t start = BlockTimings[1 + kIdx * ThreadblockCount * 2 + chIdx * 2 + 0];
+                uint64_t end = BlockTimings[1 + kIdx * ThreadblockCount * 2 + chIdx * 2 + 1];
+
+                fprintf(
+                    f,
+                    "{\"ph\": \"X\", \"name\": \"CUTLASS #%zu, block #%zu\", \"ts\": %lu, \"dur\": %lu},\n",
+                    kIdx, chIdx, static_cast<uint64_t>(std::round(start / 1000.0)), static_cast<uint64_t>(std::round((end - start) / 1000.0))
+                );
+            }
+        }
+
+        fprintf(f, "{}]}\n");
+        fclose(f);
+    }
+}
+
 template <
     typename layoutA,
     typename layoutB,
@@ -307,6 +335,14 @@ public:
             TORCH_CHECK(false, "Grouped GEMM execution not possible with HW");
         }
 
+        if (BlockTimings == nullptr) {
+            // Counter + 30 kernel triples, each having threadblock_count blocks and 2 entries (start and stop).
+            size_t timingsSize = (1 + 3 * 30 * threadblock_count * 2) * sizeof(uint64_t);
+            TORCH_CHECK(cudaHostAlloc(&BlockTimings, timingsSize, cudaHostAllocMapped) == cudaSuccess);
+            memset(BlockTimings, 0, timingsSize);
+            ThreadblockCount = threadblock_count;
+        }
+
         // We don't specify `host_problem_sizes` because we don't know them.
         // This is fine, since the default `GroupScheduleMode_` is `kDeviceOnly`.
         typename GemmGrouped::EpilogueOutputOp::Params epilogue_op(/*alpha=*/1.0f, /*beta=*/0.0f);
@@ -322,7 +358,8 @@ public:
                             /*ldb=*/(int64_t*)ldb.data_ptr(),
                             /*ldc=*/(int64_t*)ldc.data_ptr(),
                             /*ldd=*/(int64_t*)ldc.data_ptr(),
-                            (cutlass::gemm::GemmCoord*)(batch_sizes.is_cuda() ? nullptr : problem_sizes_host.data()));
+                            (cutlass::gemm::GemmCoord*)(batch_sizes.is_cuda() ? nullptr : problem_sizes_host.data()),
+                            BlockTimings);
 
         if (batch_sizes.is_cuda()) {
             // Use a single block so that we don't need any additional global memory.
@@ -353,10 +390,10 @@ public:
         if(gemm.run(c10::cuda::getCurrentCUDAStream()) != cutlass::Status::kSuccess) {
             TORCH_CHECK(false, "Failed to run CUTLASS Grouped GEMM");
         }
+        TORCH_CHECK(cudaLaunchHostFunc(c10::cuda::getCurrentCUDAStream(), bumpKernelCounter, nullptr) == cudaSuccess);
         return c;
     }
 };
-
 
 namespace grouped_gemm {
     // NOTE: We only support dynamic group sizes for the 'a' tensor. Tensor 'b' is
